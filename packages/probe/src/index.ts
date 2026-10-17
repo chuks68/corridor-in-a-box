@@ -20,6 +20,15 @@ import { isSafeUrl } from "./url-safety";
 
 export { tomlHash } from "./toml-hash";
 export { isSafeUrl } from "./url-safety";
+export {
+  ANCHOR_KINDS,
+  isValidAnchorDomain,
+  loadFleet,
+  parseFleet,
+  type AnchorEntry,
+  type AnchorFleet,
+  type AnchorKind,
+} from "./fleet";
 
 /** SEP numbers in registry bit order. Must match SEP_NUMBERS in contracts/registry. */
 export const SEP_NUMBERS = [1, 6, 10, 12, 24, 31, 38] as const;
@@ -66,6 +75,8 @@ export interface ProbeResult {
   readonly tomlHash: string;
   /** Per-probe detail, in the order probes were attempted. */
   readonly outcomes: readonly ProbeOutcome[];
+  /** Raw text of stellar.toml if successfully fetched. */
+  readonly toml?: string;
 }
 
 export interface ProbeOptions {
@@ -81,7 +92,7 @@ export interface ProbeOptions {
 const ZERO_HASH = "0".repeat(64);
 
 /** Endpoint keys in a stellar.toml, and which SEP each one implies. */
-const TOML_ENDPOINTS: ReadonlyArray<{ key: string; sep: SepNumber }> = [
+export const TOML_ENDPOINTS: ReadonlyArray<{ key: string; sep: SepNumber }> = [
   { key: "TRANSFER_SERVER", sep: 6 },
   { key: "WEB_AUTH_ENDPOINT", sep: 10 },
   { key: "KYC_SERVER", sep: 12 },
@@ -272,51 +283,7 @@ export async function probeAnchor(
     }
   }
 
-  // --- SEP-6: info and auth checks ---------------------------------------
-  const sep6 = endpoint.get(6);
-  if (sep6) {
-    let withdrawAssets: string[] = [];
-    try {
-      const res = await get(`${sep6}/info`);
-      if (!res.ok) throw new Error(`info HTTP ${res.status}`);
-      const j = (await res.json()) as {
-        withdraw?: Record<string, { enabled?: boolean }>;
-        "withdraw-exchange"?: Record<string, { enabled?: boolean }>;
-      };
-      const withdraw = j.withdraw ?? {};
-      const withdrawExchange = j["withdraw-exchange"] ?? {};
-      const enabledWithdraw = Object.entries(withdraw)
-        .filter(([, v]) => v?.enabled !== false)
-        .map(([k]) => k);
-      const enabledWithdrawExchange = Object.entries(withdrawExchange)
-        .filter(([, v]) => v?.enabled !== false)
-        .map(([k]) => k);
-      withdrawAssets = Array.from(new Set([...enabledWithdraw, ...enabledWithdrawExchange]));
-      if (withdrawAssets.length === 0) {
-        throw new Error(
-          "withdraw list is EMPTY — advertises SEP-6 but accepts no withdrawals",
-        );
-      }
-      record("sep6_info", true, `withdraws ${withdrawAssets.join(", ")}`);
-    } catch (e) {
-      record("sep6_info", false, why(e));
-    }
-
-    if (token) {
-      try {
-        const assetParam = withdrawAssets[0]
-          ? `?asset_code=${encodeURIComponent(withdrawAssets[0])}`
-          : "";
-        const res = await get(`${sep6}/transactions${assetParam}`, { headers: authHeader });
-        if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
-        record("sep6_auth", true, `HTTP ${res.status}`);
-      } catch (e) {
-        record("sep6_auth", false, why(e));
-      }
-    }
-  }
-
-  return { domain, seps, probesRun, probesPassed, tomlHash, outcomes };
+  return { domain, seps, probesRun, probesPassed, tomlHash, outcomes, toml };
 }
 
 export interface FormattedProbeResultJson {
