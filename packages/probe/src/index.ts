@@ -284,6 +284,52 @@ export async function probeAnchor(
     }
   }
 
+  // --- SEP-6: does the transfer server withdraw anything? ----------------
+  const sep6 = endpoint.get(6);
+  let sep6Asset: string | undefined;
+  if (sep6) {
+    try {
+      const res = await get(`${sep6}/info`, { headers: authHeader });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      type Sep6Section = Record<string, { enabled?: boolean }>;
+      const j = (await res.json()) as {
+        withdraw?: Sep6Section;
+        "withdraw-exchange"?: Sep6Section;
+      };
+      // SEP-6 requires `enabled` on every asset; an asset that is not explicitly
+      // enabled is not a working lane, the same way an empty SEP-31 receive list is not.
+      const enabled = (section: Sep6Section | undefined) =>
+        Object.entries(section ?? {})
+          .filter(([, v]) => v?.enabled === true)
+          .map(([code]) => code);
+      const assets = [
+        ...new Set([...enabled(j.withdraw), ...enabled(j["withdraw-exchange"])]),
+      ];
+      if (assets.length === 0) {
+        throw new Error("withdraw list is EMPTY — advertises SEP-6 but withdraws nothing");
+      }
+      sep6Asset = assets[0];
+      record("sep6_info", true, `withdraws ${assets.join(", ")}`);
+    } catch (e) {
+      record("sep6_info", false, why(e));
+    }
+  }
+
+  // --- SEP-6 auth: an authenticated read, not just a public /info --------
+  if (sep6 && token && sep6Asset) {
+    try {
+      const res = await get(
+        `${sep6}/transactions?asset_code=${encodeURIComponent(sep6Asset)}`,
+        { headers: authHeader },
+      );
+      // As with SEP-12: a 4xx is a valid SEP-6 answer, a 5xx is not.
+      if (res.status >= 500) throw new Error(`HTTP ${res.status}`);
+      record("sep6_auth", true, `HTTP ${res.status}`);
+    } catch (e) {
+      record("sep6_auth", false, why(e));
+    }
+  }
+
   return { domain, seps, probesRun, probesPassed, tomlHash, outcomes, toml };
 }
 
