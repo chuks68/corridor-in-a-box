@@ -121,17 +121,39 @@ export interface KycResult {
 Instructs the counterparty to prepare a payout transaction and returns the deposit instructions (where to send the bridge asset).
 
 ```ts
+export type DepositInstructions =
+  | {
+      readonly kind: "stellar_payment";
+      readonly to: string;
+      readonly memo?: string;
+      readonly memoType?: "text" | "hash" | "id";
+      readonly asset?: string;
+    }
+  | {
+      readonly kind: "claimable_balance";
+      readonly claimant: string;
+      readonly asset?: string;
+      readonly predicateSeconds?: number;
+    }
+  | { readonly kind: "adapter_settled"; readonly reference?: string };
+
 export interface OpenTransaction {
   readonly transactionId: string;
-  readonly depositAddress: string;
+  readonly instructions: DepositInstructions;
+  readonly amountIn?: Money;
+  /** @deprecated Read from `instructions`. Kept for one release. */
+  readonly depositAddress?: string;
+  /** @deprecated Read from `instructions`. Kept for one release. */
   readonly memo?: string;
+  /** @deprecated Read from `instructions`. Kept for one release. */
   readonly memoType?: "text" | "hash" | "id";
 }
 ```
 
 #### Invariants & Rules
 
-- **Deposit instructions**: `depositAddress` must be the Stellar account where the bridge asset should be paid.
+- **Deposit instructions**: return `instructions`, and make its `kind` one of the kinds you list in `capabilities().settlement`. For a normal on-chain payout that is `{ kind: "stellar_payment", to, memo, memoType }`, where `to` is the Stellar account the bridge asset should be paid to. The engine routes settlement on `instructions.kind`; a kind with no matching strategy fails closed with `SETTLEMENT_FAILED` before anything is submitted.
+- **Legacy fields**: the flat `depositAddress`/`memo`/`memoType` are deprecated. Set them alongside `instructions` only if you must support an older engine; new adapters should set `instructions` alone (`toLegacy()` derives the flat view for callers that still need it).
 - **`memoType` precision**:
   - `"text"`: Up to 28 UTF-8 bytes.
   - `"id"`: 64-bit unsigned integer string.
@@ -193,7 +215,7 @@ export interface TransactionStatus {
    - `"external"`: Handed off to a downstream clearing house or local banking rail (e.g., ACH, SEPA, SPEI, NIBSS). Uses `externalStallMs` rather than strict short-count poll stall limits.
 
 5. **Expected transaction reflection (`amountIn`, `depositAddress`, `memo`)**:
-   When the partner's status record reports back the deposit parameters it expects, populate `amountIn`, `depositAddress`, `memo`, and `memoType`. The engine's pre-settle verification checks these fields against the payment intent to catch drift or tampering before on-chain funds move.
+   When the partner's status record reports back the deposit parameters it expects, populate `amountIn`, `depositAddress`, `memo`, and `memoType` on the `TransactionStatus`. The engine's pre-settle verification checks these fields against the payment intent to catch drift or tampering before on-chain funds move.
 
 6. **Refund details (`RefundInfo`)**:
    If the anchor executes a refund, populate `refunds`:
@@ -286,11 +308,15 @@ sequenceDiagram
 
 ## Deposit instructions kinds and settlement strategies
 
-The engine uses pluggable `SettlementStrategy` implementations to deliver the bridge asset based on the `kind` of deposit instructions returned when a transaction is opened:
+The engine uses pluggable `SettlementStrategy` implementations to deliver the bridge asset. `settle()` picks the first strategy whose `kind` equals `opened.instructions.kind`, and fails closed (`SETTLEMENT_FAILED`, not retryable) if none matches, so no money moves on a path nothing handles.
 
-- Current default kind: `"stellar_payment"` (`DepositInstructionsKind` in `@corridor/engine`).
-- When `openTransaction` returns an `OpenTransaction`, the engine routes settlement to `StellarPaymentStrategy`, which builds, signs, and submits a Stellar payment of `corridor.settlement.bridge_asset` to `depositAddress` with `memo` and `memoType`.
-- If an integration requires an alternative settlement mechanism (such as claimable balances or Soroban liquidity pools), declare the corresponding settlement identifier in `capabilities().settlement` and register a matching strategy in `EngineDeps.strategies`.
+| `instructions.kind` | Strategy                                                              | What it does                                                                                    |
+| ------------------- | --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `stellar_payment`   | `StellarPaymentStrategy` (`@corridor/engine`, in `defaultStrategies`) | Submits a Stellar payment of `corridor.settlement.bridge_asset` to `to` with `memo`/`memoType`. |
+| `claimable_balance` | `StellarClaimableBalanceStrategy` (`@corridor/stellar`)               | Creates a claimable balance for `claimant`, optionally time-limited by `predicateSeconds`.      |
+| `adapter_settled`   | none built in                                                         | Settlement happens off-chain inside the adapter; register your own strategy for it.             |
+
+Declare the kinds your adapter can issue in `capabilities().settlement`, and register a matching strategy in `EngineDeps.strategies` for any kind beyond `stellar_payment`. The engine runs `checkCompatibility()` before the first adapter call and fails the run with `CAPABILITY_MISMATCH` if a declared kind has no configured strategy.
 
 ---
 
@@ -338,22 +364,19 @@ Follow the principles detailed in [docs/key-management.md](./key-management.md):
 
 ## Conformance testing
 
-`@corridor/adapter-kit` includes a minimal conformance test suite to verify baseline behavior:
+`@corridor/adapter-kit` ships a framework-agnostic harness. `runConformance()` returns a structured report instead of asserting, so you can use it from any test runner or a script:
 
 ```ts
-import { conformanceSuite } from "@corridor/adapter-kit";
+import { runConformance } from "@corridor/adapter-kit";
 
-const suite = conformanceSuite(myBespokeAdapter, intent, corridor);
-for (const probe of suite) {
-  const ok = await probe.run();
-  console.log(`${probe.name}: ${ok ? "PASS" : "FAIL"}`);
+const report = await runConformance(myBespokeAdapter, { intent, corridor });
+for (const r of report.results) {
+  console.log(`${r.name}: ${r.passed ? "PASS" : "FAIL"} (${r.detail})`);
 }
+if (!report.passed) process.exitCode = 1;
 ```
 
-The suite probes:
-
-1. `"quote returns a future expiry"`: Validates that `requestQuote` succeeds and returns a timestamp in the future.
-2. `"compliance resolves to a known status"`: Validates that `ensureCompliance` returns `"accepted"`, `"pending"`, or `"rejected"` without erroring out.
+By default only read-only probes run. Pass `{ allowNetworkWrites: true }` as the third argument to also exercise `openTransaction()`, which checks that the returned `instructions.kind` is listed in `capabilities().settlement`. The probes cover: well-formed `capabilities()`, quote kinds matching `capabilities().quotes`, a known compliance status, `getTransaction()` on an unknown id returning a failure `Outcome` (never a throw), and no method throwing on a malformed corridor. See `packages/adapter-kit/README.md` for the vitest helper (`expectConformance`). The older `conformanceSuite()` remains as a thin wrapper.
 
 You should extend your adapter's test suite with unit tests verifying:
 
